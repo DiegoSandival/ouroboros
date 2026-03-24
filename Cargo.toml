@@ -1,0 +1,11 @@
+[package]
+name = "ouroboros_db"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+thiserror = "1.0"
+dotenvy = "0.15"
+serde = { version = "1.0", features = ["derive"] } # Para serializar la configuración
+serde_json = "1.0" # Para guardar el archivo de metadatos
+tempfile = "3.8" # Para crear archivos temporales que se borran solos al terminar el test

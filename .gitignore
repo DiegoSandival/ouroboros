@@ -1,0 +1,6 @@
+/target
+/target
+/demo_ouroboros.db
+/demo_ouroboros.db.meta
+/.env
+**/*.rs.bk
