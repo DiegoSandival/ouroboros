@@ -28,11 +28,13 @@ fn main() -> Result<()> {
         let config = OuroborosConfig::load_or_init(db_path)?;
         let mut db = OuroborosDB::open(db_path, config)?;
 
-        for i in 0..5 {
-            let mut data = vec![0u8; 96];
-            data[0] = i as u8; 
-            db.append(&data)?;
-        }
+      // En el Bloque 1 de tu basico.rs
+for i in 0..5 {
+    let mut data = vec![0u8; 96];
+    data[0] = i as u8; 
+    let idx = db.append(&data)?; // <--- Ahora capturas el índice
+    println!("Dato guardado en el índice: {:?}", idx);
+}
         
         let mut data = vec![0u8; 96];
         data[0] = 99; // Sobrescribe el índice 0

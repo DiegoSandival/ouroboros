@@ -90,8 +90,8 @@ impl OuroborosDB {
         })
     }
 
-    /// Escribe secuencialmente. Requiere acceso exclusivo (&mut self).
-    pub fn append(&mut self, data: &[u8]) -> Result<()> {
+   /// Escribe secuencialmente y devuelve el índice donde se guardó el registro.
+    pub fn append(&mut self, data: &[u8]) -> Result<RecordIndex> { // Cambio de firma: -> Result<RecordIndex>
         if data.len() != self.config.data_size {
             return Err(OuroborosError::InvalidDataSize {
                 expected: self.config.data_size,
@@ -99,20 +99,26 @@ impl OuroborosDB {
             });
         }
 
+        // 1. Guardamos el índice actual antes de mover el cursor
+        let saved_index = self.cursor; 
+
         let mut buffer = vec![0u8; self.config.record_size() as usize];
         buffer[0] = self.phase.0;
         buffer[1..].copy_from_slice(data);
 
-        let offset = (self.cursor.0 as u64) * self.config.record_size();
+        // 2. Usamos el índice capturado para el offset
+        let offset = (saved_index.0 as u64) * self.config.record_size();
         self.file.write_all_at_pos(&buffer, offset)?;
 
+        // 3. Lógica de avance del cursor (se mantiene igual)
         self.cursor.0 += 1;
         if self.cursor.0 >= self.config.max_records {
             self.cursor.0 = 0;
             self.phase.toggle();
         }
 
-        Ok(())
+        // 4. Devolvemos el índice donde efectivamente se escribió
+        Ok(saved_index)
     }
 
     /// Actualiza un registro. Requiere acceso exclusivo (&mut self).
@@ -297,4 +303,17 @@ mod tests {
         assert_eq!(db_recovered.cursor.0, 2);
         assert_eq!(db_recovered.phase, PhaseBit(1));
     }
+
+    #[test]
+fn test_append_returns_correct_index() {
+    let temp_file = NamedTempFile::new().unwrap();
+    let config = test_config(); // max_records: 5
+    let mut db = OuroborosDB::open(temp_file.path(), config).unwrap();
+
+    let idx0 = db.append(&[1; 4]).unwrap();
+    let idx1 = db.append(&[2; 4]).unwrap();
+
+    assert_eq!(idx0, RecordIndex(0));
+    assert_eq!(idx1, RecordIndex(1));
+}
 }
