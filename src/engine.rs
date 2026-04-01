@@ -55,6 +55,13 @@ impl PositionalIo for File {
 
 // --- Motor Principal ---
 
+/// Motor principal de OuroborosDB.
+///
+/// Mantiene abierto el archivo principal, conoce la configuracion estructural del anillo
+/// y recuerda el siguiente slot fisico donde se escribira con [`append`](Self::append).
+///
+/// El motor no implementa sincronizacion interna. Para multi-threading, la aplicacion debe
+/// envolverlo en una primitiva externa como `Arc<RwLock<_>>`.
 pub struct OuroborosDB {
     file: File,
     cursor: RecordIndex,
@@ -63,6 +70,27 @@ pub struct OuroborosDB {
 }
 
 impl OuroborosDB {
+    /// Abre o crea el archivo principal y recupera el estado del anillo.
+    ///
+    /// Si el archivo esta vacio, lo preasigna a `max_records * record_size()` bytes.
+    /// Si ya existe, exige que su tamano coincida con la configuracion proporcionada.
+    ///
+    /// Durante la apertura, el motor reconstruye el siguiente punto de escritura y la fase
+    /// activa leyendo bits de fase desde el archivo.
+    ///
+    /// ```no_run
+    /// use ouroboros_db::{OuroborosConfig, OuroborosDB, Result};
+    ///
+    /// fn main() -> Result<()> {
+    ///     let config = OuroborosConfig {
+    ///         data_size: 16,
+    ///         max_records: 1024,
+    ///     };
+    ///     let db = OuroborosDB::open("telemetria.db", config)?;
+    ///     assert_eq!(db.next_write_index().0, 0);
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn open<P: AsRef<Path>>(path: P, config: OuroborosConfig) -> Result<Self> {
         let file = OpenOptions::new()
             .read(true)
@@ -90,8 +118,53 @@ impl OuroborosDB {
         })
     }
 
-   /// Escribe secuencialmente y devuelve el índice donde se guardó el registro.
-    pub fn append(&mut self, data: &[u8]) -> Result<RecordIndex> { // Cambio de firma: -> Result<RecordIndex>
+    /// Devuelve el siguiente slot fisico donde `append` escribira.
+    ///
+    /// Este valor representa el cursor actual del anillo y es util para exponer estado
+    /// operacional sin acceder a campos internos.
+    ///
+    /// ```no_run
+    /// use ouroboros_db::{OuroborosConfig, OuroborosDB, Result};
+    ///
+    /// fn main() -> Result<()> {
+    ///     let config = OuroborosConfig {
+    ///         data_size: 4,
+    ///         max_records: 8,
+    ///     };
+    ///     let mut db = OuroborosDB::open("cursor.db", config)?;
+    ///     assert_eq!(db.next_write_index().0, 0);
+    ///
+    ///     db.append(&[1, 2, 3, 4])?;
+    ///     assert_eq!(db.next_write_index().0, 1);
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn next_write_index(&self) -> RecordIndex {
+        self.cursor
+    }
+
+    /// Escribe un payload en el slot actual del cursor y devuelve ese indice fisico.
+    ///
+    /// Requiere que `data.len() == config.data_size`.
+    /// Si el cursor alcanza `max_records`, vuelve a `0` y alterna la fase activa.
+    /// Eso implica que llamadas futuras pueden sobrescribir datos antiguos.
+    ///
+    /// ```no_run
+    /// use ouroboros_db::{OuroborosConfig, OuroborosDB, Result};
+    ///
+    /// fn main() -> Result<()> {
+    ///     let config = OuroborosConfig {
+    ///         data_size: 4,
+    ///         max_records: 8,
+    ///     };
+    ///     let mut db = OuroborosDB::open("append.db", config)?;
+    ///
+    ///     let slot = db.append(&[10, 20, 30, 40])?;
+    ///     assert_eq!(slot.0, 0);
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn append(&mut self, data: &[u8]) -> Result<RecordIndex> {
         if data.len() != self.config.data_size {
             return Err(OuroborosError::InvalidDataSize {
                 expected: self.config.data_size,
@@ -121,7 +194,25 @@ impl OuroborosDB {
         Ok(saved_index)
     }
 
-    /// Actualiza un registro. Requiere acceso exclusivo (&mut self).
+    /// Reemplaza el payload almacenado en un slot fisico existente.
+    ///
+    /// Esta operacion conserva el `phase bit` original del slot para no romper la logica
+    /// de recuperacion del cursor. Requiere acceso exclusivo porque modifica el archivo.
+    ///
+    /// ```no_run
+    /// use ouroboros_db::{OuroborosConfig, OuroborosDB, RecordIndex, Result};
+    ///
+    /// fn main() -> Result<()> {
+    ///     let config = OuroborosConfig {
+    ///         data_size: 4,
+    ///         max_records: 8,
+    ///     };
+    ///     let mut db = OuroborosDB::open("update.db", config)?;
+    ///     db.append(&[1, 1, 1, 1])?;
+    ///     db.update(RecordIndex(0), &[9, 9, 9, 9])?;
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn update(&mut self, index: RecordIndex, data: &[u8]) -> Result<()> {
         if index.0 >= self.config.max_records {
             return Err(OuroborosError::IndexOutOfBounds {
@@ -148,8 +239,29 @@ impl OuroborosDB {
         Ok(())
     }
 
-    /// ¡LA MAGIA CONCURRENTE! Ahora solo requiere un préstamo inmutable (&self).
-    /// Esto permite infinitas lecturas simultáneas a nivel de aplicación.
+    /// Lee el payload almacenado en un slot fisico.
+    ///
+    /// Usa I/O posicional y solo requiere `&self`, lo que permite multiples lecturas
+    /// concurrentes si la aplicacion coordina el acceso compartido al motor.
+    ///
+    /// El byte de fase no se expone; el resultado contiene solo el payload de usuario.
+    ///
+    /// ```no_run
+    /// use ouroboros_db::{OuroborosConfig, OuroborosDB, Result};
+    ///
+    /// fn main() -> Result<()> {
+    ///     let config = OuroborosConfig {
+    ///         data_size: 4,
+    ///         max_records: 8,
+    ///     };
+    ///     let mut db = OuroborosDB::open("read.db", config)?;
+    ///     let slot = db.append(&[5, 6, 7, 8])?;
+    ///
+    ///     let payload = db.read(slot)?;
+    ///     assert_eq!(payload, vec![5, 6, 7, 8]);
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn read(&self, index: RecordIndex) -> Result<Vec<u8>> {
         if index.0 >= self.config.max_records {
             return Err(OuroborosError::IndexOutOfBounds {
@@ -168,6 +280,7 @@ impl OuroborosDB {
 
     // --- RECUPERACIÓN PRIVADA SIN CURSOR ---
 
+    /// Recupera el siguiente punto de escritura y la fase activa del anillo.
     fn recover_state(file: &File, config: &OuroborosConfig) -> Result<(RecordIndex, PhaseBit)> {
         let mut low = 0;
         let mut high = config.max_records - 1;
@@ -195,6 +308,7 @@ impl OuroborosDB {
         Ok((RecordIndex(low), phase_first))
     }
 
+    /// Lee el bit de fase almacenado en un slot sin interpretar el payload.
     fn read_phase_bit_raw(file: &File, index: u32, config: &OuroborosConfig) -> Result<PhaseBit> {
         let offset = (index as u64) * config.record_size();
         let mut buf = [0u8; 1];
@@ -239,13 +353,13 @@ mod tests {
         let config = test_config(); // max_records: 5
         let mut db = OuroborosDB::open(temp_file.path(), config).unwrap();
 
-        // Escribimos 5 registros (llenamos la DB, fase = 0)
+        // En una base nueva la primera vuelta se escribe con fase 1.
         for i in 0..5 {
             db.append(&[i; 4]).unwrap();
         }
 
         assert_eq!(db.cursor.0, 0); // El cursor debió dar la vuelta
-        assert_eq!(db.phase, PhaseBit(1)); // La fase debió cambiar a 1
+        assert_eq!(db.phase, PhaseBit(0)); // Tras completar la vuelta, la fase activa alterna a 0
 
         // Escribimos un 6to registro (sobrescribe el índice 0)
         db.append(&[99; 4]).unwrap();
@@ -272,9 +386,9 @@ mod tests {
         assert_eq!(read_data, vec![2, 2, 2, 2]);
 
         // Verificamos que el bit de fase interno NO se rompió
-        let mut file = file = OpenOptions::new().read(true).open(temp_file.path()).unwrap();
-        let phase = OuroborosDB::read_phase_bit_raw(&mut file, 0, &test_config()).unwrap();
-        assert_eq!(phase, PhaseBit(0)); 
+        let file = OpenOptions::new().read(true).open(temp_file.path()).unwrap();
+        let phase = OuroborosDB::read_phase_bit_raw(&file, 0, &test_config()).unwrap();
+        assert_eq!(phase, PhaseBit(1)); 
     }
 
     #[test]
@@ -286,9 +400,9 @@ mod tests {
         {
             let mut db = OuroborosDB::open(temp_file.path(), config.clone()).unwrap();
             
-            // Escribimos 7 registros (Llena los 5, da la vuelta, escribe 2 más)
-            // Esto significa que los índices 0 y 1 tienen fase 1.
-            // Los índices 2, 3 y 4 tienen fase 0.
+            // Escribimos 7 registros. La primera vuelta usa fase 1 y la segunda fase 0.
+            // Esto significa que los índices 0 y 1 tienen fase 0.
+            // Los índices 2, 3 y 4 conservan fase 1.
             for i in 0..7 {
                 db.append(&[i; 4]).unwrap();
             }
@@ -299,21 +413,38 @@ mod tests {
         let db_recovered = OuroborosDB::open(temp_file.path(), config).unwrap();
 
         // ¡La magia de Ouroboros! Debe saber exactamente dónde se quedó.
-        // El siguiente registro a escribir debería ser el índice 2, y la fase actual debería ser 1.
+        // El siguiente registro a escribir debería ser el índice 2, y la fase actual debería ser 0.
         assert_eq!(db_recovered.cursor.0, 2);
-        assert_eq!(db_recovered.phase, PhaseBit(1));
+        assert_eq!(db_recovered.phase, PhaseBit(0));
     }
 
     #[test]
-fn test_append_returns_correct_index() {
-    let temp_file = NamedTempFile::new().unwrap();
-    let config = test_config(); // max_records: 5
-    let mut db = OuroborosDB::open(temp_file.path(), config).unwrap();
+    fn test_append_returns_correct_index() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let config = test_config(); // max_records: 5
+        let mut db = OuroborosDB::open(temp_file.path(), config).unwrap();
 
-    let idx0 = db.append(&[1; 4]).unwrap();
-    let idx1 = db.append(&[2; 4]).unwrap();
+        let idx0 = db.append(&[1; 4]).unwrap();
+        let idx1 = db.append(&[2; 4]).unwrap();
 
-    assert_eq!(idx0, RecordIndex(0));
-    assert_eq!(idx1, RecordIndex(1));
-}
+        assert_eq!(idx0, RecordIndex(0));
+        assert_eq!(idx1, RecordIndex(1));
+    }
+
+    #[test]
+    fn test_next_write_index_tracks_cursor() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let config = test_config();
+        let mut db = OuroborosDB::open(temp_file.path(), config).unwrap();
+
+        assert_eq!(db.next_write_index(), RecordIndex(0));
+
+        db.append(&[1; 4]).unwrap();
+        assert_eq!(db.next_write_index(), RecordIndex(1));
+
+        for _ in 0..4 {
+            db.append(&[9; 4]).unwrap();
+        }
+        assert_eq!(db.next_write_index(), RecordIndex(0));
+    }
 }

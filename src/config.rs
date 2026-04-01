@@ -16,8 +16,16 @@ struct MetadataFile {
 }
 
 impl OuroborosConfig {
-    /// Carga la configuración de una base de datos existente o crea una nueva
-    /// congelando los parámetros actuales del entorno (.env).
+    /// Carga la configuracion de una base existente o inicializa una nueva.
+    ///
+    /// Comportamiento:
+    ///
+    /// - Si existe `<db_path>.meta`, la configuracion se lee desde ahi.
+    /// - Si no existe, se intenta construir la configuracion desde variables de entorno
+    ///   y se persiste inmediatamente en el sidecar `.meta`.
+    ///
+    /// Esto garantiza que la forma de interpretar el archivo principal no cambie entre
+    /// ejecuciones aunque el entorno de la aplicacion sea distinto.
     pub fn load_or_init(db_path: &str) -> Result<Self> {
         let meta_path = format!("{}.meta", db_path);
 
@@ -32,7 +40,7 @@ impl OuroborosConfig {
         }
     }
 
-    /// Lee estrictamente del archivo de metadatos ignorando el entorno
+    /// Lee estrictamente el sidecar de metadata e ignora el entorno.
     fn load_from_meta(meta_path: &str) -> Result<Self> {
         let mut file = File::open(meta_path)?;
         let mut contents = String::new();
@@ -47,7 +55,12 @@ impl OuroborosConfig {
         })
     }
 
-    /// Lee las variables de entorno para una nueva inicialización
+    /// Construye una configuracion nueva a partir del entorno.
+    ///
+    /// Variables esperadas:
+    ///
+    /// - `OUROBOROS_DATA_SIZE`
+    /// - `OUROBOROS_MAX_RECORDS`
     fn from_env() -> Result<Self> {
         // Intentamos cargar el .env, pero si no existe no fallamos (podrían estar exportadas en el SO)
         let _ = dotenvy::dotenv();
@@ -68,7 +81,7 @@ impl OuroborosConfig {
         })
     }
 
-    /// Guarda la configuración permanentemente en el disco
+    /// Persiste la configuracion en el sidecar JSON `.meta`.
     fn save_to_meta(&self, meta_path: &str) -> Result<()> {
         let meta = MetadataFile {
             data_size: self.data_size,
