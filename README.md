@@ -148,5 +148,3 @@ Ejecuta las pruebas con:
 cargo test
 ```
 
-Si todavia no publicas la libreria en `crates.io`, puedes consumirla por `path` o por Git,
-segun donde viva el repositorio real.
