@@ -18,6 +18,7 @@ fn main() -> Result<()> {
     let directory = temp_dir();
     let config_path = directory.join(Config::DEFAULT_FILE_NAME);
     let data_path = directory.join("example.db");
+    let lock_path = directory.join("example.writer.lock");
 
     fs::write(&config_path, "data_path = \"example.db\"\nmax_records = 8\n")?;
 
@@ -57,8 +58,11 @@ fn main() -> Result<()> {
         updated_auth.genoma, updated_auth.x, updated_auth.y, updated_auth.z
     );
 
+    drop(db);
+
     fs::remove_file(data_path)?;
     fs::remove_file(config_path)?;
+    fs::remove_file(lock_path)?;
     fs::remove_dir(directory)?;
 
     Ok(())

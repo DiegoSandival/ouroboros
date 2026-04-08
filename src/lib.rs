@@ -6,6 +6,6 @@ pub mod genoma;
 
 pub use cell::Celula;
 pub use config::Config;
-pub use db::OuroborosDb;
+pub use db::{OuroborosDb, OuroborosReader};
 pub use error::{Error, Result};
-pub use genoma::{get_ghost, set_ghost, Genoma};
+pub use genoma::{get_ghost, normalize_genoma, parse_genoma_le_bytes, set_ghost, Genoma};

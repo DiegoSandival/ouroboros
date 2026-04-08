@@ -10,6 +10,8 @@ use crate::error::{Error, Result};
 pub struct Config {
     pub data_path: PathBuf,
     pub max_records: u32,
+    #[serde(default)]
+    pub sync_writes: bool,
 }
 
 impl Config {
@@ -74,6 +76,23 @@ mod tests {
         let config = Config::from_path(&config_path).expect("config should load");
         assert_eq!(config.max_records, 8);
         assert_eq!(config.data_path, directory.join("ring.db"));
+        assert!(!config.sync_writes);
+
+        fs::remove_dir_all(directory).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn read_sync_writes_when_provided() {
+        let directory = temp_dir();
+        let config_path = directory.join(Config::DEFAULT_FILE_NAME);
+        fs::write(
+            &config_path,
+            "data_path = \"ring.db\"\nmax_records = 8\nsync_writes = true\n",
+        )
+        .expect("config file should be written");
+
+        let config = Config::from_path(&config_path).expect("config should load");
+        assert!(config.sync_writes);
 
         fs::remove_dir_all(directory).expect("temporary directory should be removed");
     }

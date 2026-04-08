@@ -1,17 +1,74 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 
+use fs2::FileExt;
+
 use crate::cell::Celula;
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::genoma::{get_ghost, set_ghost};
+use crate::genoma::{get_ghost, normalize_genoma, set_ghost};
 
 #[derive(Debug)]
 pub struct OuroborosDb {
     file: File,
+    _writer_lock: File,
     cursor: u32,
     phase: bool,
     max_records: u32,
+    sync_writes: bool,
+}
+
+#[derive(Debug)]
+pub struct OuroborosReader {
+    file: File,
+    max_records: u32,
+}
+
+impl OuroborosReader {
+    pub fn open_default() -> Result<Self> {
+        let config = Config::load_default()?;
+        Self::open_with_config(&config)
+    }
+
+    pub fn open_from_path(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        let config = Config::from_path(path)?;
+        Self::open_with_config(&config)
+    }
+
+    pub fn open_with_config(config: &Config) -> Result<Self> {
+        let expected_size = OuroborosDb::expected_file_size(config.max_records)?;
+
+        let file = OpenOptions::new().read(true).open(&config.data_path)?;
+        let actual_size = file.metadata()?.len();
+        if actual_size != expected_size {
+            return Err(Error::InvalidFileSize {
+                expected: expected_size,
+                actual: actual_size,
+            });
+        }
+
+        Ok(Self {
+            file,
+            max_records: config.max_records,
+        })
+    }
+
+    pub fn max_records(&self) -> u32 {
+        self.max_records
+    }
+
+    pub fn read(&self, index: u32) -> Result<Celula> {
+        OuroborosDb::read_raw_from_handle(&self.file, index, self.max_records)
+    }
+
+    pub fn read_auth(&self, index: u32, secret: &[u8]) -> Result<Celula> {
+        let celula = self.read(index)?;
+        let expected_hash = Celula::hash_secret(&celula.salt, secret);
+        if expected_hash != celula.hash {
+            return Err(Error::Unauthorized);
+        }
+        Ok(celula)
+    }
 }
 
 impl OuroborosDb {
@@ -33,6 +90,14 @@ impl OuroborosDb {
                 fs::create_dir_all(parent)?;
             }
         }
+
+        let lock_path = config.data_path.with_extension("writer.lock");
+        let writer_lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(lock_path)?;
+        writer_lock.try_lock_exclusive()?;
 
         let existed = config.data_path.exists();
         let mut file = OpenOptions::new()
@@ -56,9 +121,18 @@ impl OuroborosDb {
 
         Ok(Self {
             file,
+            _writer_lock: writer_lock,
             cursor,
             phase,
             max_records: config.max_records,
+            sync_writes: config.sync_writes,
+        })
+    }
+
+    pub fn reader(&self) -> Result<OuroborosReader> {
+        Ok(OuroborosReader {
+            file: self.file.try_clone()?,
+            max_records: self.max_records,
         })
     }
 
@@ -82,7 +156,7 @@ impl OuroborosDb {
         }
 
         let adjusted = Celula {
-            genoma: set_ghost(celula.genoma, self.phase),
+            genoma: set_ghost(normalize_genoma(celula.genoma), self.phase),
             ..celula
         };
         self.write_raw(self.cursor, adjusted)?;
@@ -97,11 +171,11 @@ impl OuroborosDb {
         Ok(saved)
     }
 
-    pub fn read(&mut self, index: u32) -> Result<Celula> {
-        self.read_raw(index)
+    pub fn read(&self, index: u32) -> Result<Celula> {
+        Self::read_raw_from_handle(&self.file, index, self.max_records)
     }
 
-    pub fn read_auth(&mut self, index: u32, secret: &[u8]) -> Result<Celula> {
+    pub fn read_auth(&self, index: u32, secret: &[u8]) -> Result<Celula> {
         let celula = self.read(index)?;
         let expected_hash = Celula::hash_secret(&celula.salt, secret);
         if expected_hash != celula.hash {
@@ -115,7 +189,7 @@ impl OuroborosDb {
         let updated = Celula {
             hash: current.hash,
             salt: current.salt,
-            genoma: set_ghost(nuevo_genoma, get_ghost(current.genoma)),
+            genoma: set_ghost(normalize_genoma(nuevo_genoma), get_ghost(current.genoma)),
             x,
             y,
             z,
@@ -136,7 +210,7 @@ impl OuroborosDb {
         let updated = Celula {
             hash: current.hash,
             salt: current.salt,
-            genoma: set_ghost(nuevo_genoma, get_ghost(current.genoma)),
+            genoma: set_ghost(normalize_genoma(nuevo_genoma), get_ghost(current.genoma)),
             x,
             y,
             z,
@@ -156,17 +230,18 @@ impl OuroborosDb {
             .ok_or(Error::ArithmeticOverflow)
     }
 
-    fn read_raw(&mut self, index: u32) -> Result<Celula> {
-        if index >= self.max_records {
+    fn read_raw_from_handle(file: &File, index: u32, max_records: u32) -> Result<Celula> {
+        if index >= max_records {
             return Err(Error::IndexOutOfBounds {
                 index,
-                max_records: self.max_records,
+                max_records,
             });
         }
 
         let mut buffer = [0u8; Celula::SIZE];
-        self.file.seek(SeekFrom::Start(Self::offset_for(index)?))?;
-        self.file.read_exact(&mut buffer)?;
+        let mut reader = file.try_clone()?;
+        reader.seek(SeekFrom::Start(Self::offset_for(index)?))?;
+        reader.read_exact(&mut buffer)?;
         Ok(Celula::deserialize(buffer))
     }
 
@@ -180,7 +255,11 @@ impl OuroborosDb {
 
         self.file.seek(SeekFrom::Start(Self::offset_for(index)?))?;
         self.file.write_all(&celula.serialize())?;
-        self.file.flush()?;
+        if self.sync_writes {
+            self.file.sync_data()?;
+        } else {
+            self.file.flush()?;
+        }
         Ok(())
     }
 
@@ -232,6 +311,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::config::Config;
+    use crate::error::Error;
     use crate::genoma::Genoma;
 
     use super::OuroborosDb;
@@ -251,6 +331,7 @@ mod tests {
         Config {
             data_path: directory.join("ring.db"),
             max_records,
+            sync_writes: false,
         }
     }
 
@@ -298,6 +379,40 @@ mod tests {
         assert_eq!(updated.y, 8);
         assert_eq!(updated.z, 7);
         assert!(!crate::get_ghost(updated.genoma));
+
+        fs::remove_dir_all(directory).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn second_writer_is_rejected_by_lock() {
+        let directory = temp_dir();
+        let config = test_config(&directory, 2);
+
+        let _first = OuroborosDb::open_with_config(&config).expect("first writer should open");
+        let second = OuroborosDb::open_with_config(&config);
+
+        assert!(matches!(second, Err(Error::Io(_))));
+
+        fs::remove_dir_all(directory).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn multiple_readers_can_read_from_writer_handle() {
+        let directory = temp_dir();
+        let config = test_config(&directory, 4);
+        let mut db = OuroborosDb::open_with_config(&config).expect("db should open");
+
+        let index = db
+            .append(Celula::with_secret([1u8; 16], b"clave", Genoma::LEER_SELF, 11, 22, 33))
+            .expect("append should succeed");
+
+        let reader_a = db.reader().expect("reader A should open");
+        let reader_b = db.reader().expect("reader B should open");
+
+        let a = reader_a.read(index).expect("reader A should read");
+        let b = reader_b.read(index).expect("reader B should read");
+
+        assert_eq!(a, b);
 
         fs::remove_dir_all(directory).expect("temporary directory should be removed");
     }
