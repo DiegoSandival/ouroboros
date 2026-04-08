@@ -1,0 +1,207 @@
+Genoma {
+    // Banderas definidas actualmente (0..11)
+    const LEER_SELF      = 1 << 0
+    const LEER_ANY       = 1 << 1
+    const ESCRIBIR_SELF  = 1 << 2
+    const ESCRIBIR_ANY   = 1 << 3
+    const BORRAR_SELF    = 1 << 4
+    const BORRAR_ANY     = 1 << 5
+    const DIFERIR        = 1 << 6
+    const FUCIONAR       = 1 << 7
+    const CLONAR         = 1 << 8
+    const DOMINANTE      = 1 << 9
+    const LEER_LIBRE     = 1 << 10
+    const MIGRADA        = 1 << 11
+    // Bits 12..30 reservados
+    const GHOST_FLAG     = 1 << 31   // Fase del anillo
+}
+
+Celula {
+    hash: [u8; 32]
+    salt: [u8; 16]
+    genoma: u32 // Representa el Genoma
+    x: u32
+    y: u32
+    z: u32
+
+    const SIZE: usize = 64
+}
+
+OuroborosDB {
+    file: File
+    cursor: u32
+    phase: bool   // valor del GHOST_FLAG para el próximo append
+    max_records: u32
+}
+
+// Empaqueta una estructura Celula en un arreglo de 64 bytes
+fn serializar(c: Celula) -> [u8; 64] {
+    let mut buffer = [0u8; 64];
+    
+    copiar_bytes(c.hash, a: buffer, offset: 0..32);
+    copiar_bytes(c.salt, a: buffer, offset: 32..48);
+    
+    escribir_u32_le(buffer, offset: 48, valor: c.genoma);
+    escribir_u32_le(buffer, offset: 52, valor: c.x);
+    escribir_u32_le(buffer, offset: 56, valor: c.y);
+    escribir_u32_le(buffer, offset: 60, valor: c.z);
+    
+    return buffer;
+}
+
+// Reconstruye una Celula a partir de 64 bytes
+fn deserializar(buffer: [u8; 64]) -> Celula {
+    return Celula {
+        hash: leer_bytes(buffer, offset: 0..32),
+        salt: leer_bytes(buffer, offset: 32..48),
+        genoma: leer_u32_le(buffer, offset: 48),
+        x: leer_u32_le(buffer, offset: 52),
+        y: leer_u32_le(buffer, offset: 56),
+        z: leer_u32_le(buffer, offset: 60)
+    };
+}
+
+// Funciones auxiliares de bits para Genoma
+fn get_ghost(genoma: u32) -> bool {
+    return (genoma & Genoma::GHOST_FLAG) != 0;
+}
+
+fn set_ghost(genoma: u32, phase: bool) -> u32 {
+    if phase {
+        return genoma | Genoma::GHOST_FLAG;
+    } else {
+        return genoma & (!Genoma::GHOST_FLAG);
+    }
+}
+
+impl OuroborosDB {
+
+    // ---------- RECUPERACIÓN ----------
+    fn recover_state(file: File, max_records: u32) -> (u32, bool) {
+        let primera_celula = read_raw(file, 0);
+        let ultima_celula = read_raw(file, max_records - 1);
+        
+        let first_phase = get_ghost(primera_celula.genoma);
+        let last_phase  = get_ghost(ultima_celula.genoma);
+
+        if first_phase == last_phase {
+            // Anillo uniforme -> empezamos en 0 con fase opuesta
+            return (0, !first_phase);
+        }
+
+        // Búsqueda binaria del primer registro con fase distinta
+        let mut low = 0;
+        let mut high = max_records - 1;
+        
+        while low < high {
+            let mid = (low + high) / 2;
+            let celula_mid = read_raw(file, mid);
+            
+            if get_ghost(celula_mid.genoma) == first_phase {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        return (low, first_phase);
+    }
+
+    // (Función interna auxiliar para no repetir código)
+    fn read_raw(file: File, index: u32) -> Celula {
+        let buffer = leer_exacto(file, offset: index * 64, tamaño: 64);
+        return deserializar(buffer);
+    }
+
+    // ---------- APPEND ----------
+    fn append(&mut self, celula: Celula) -> Result<u32> {
+        // 1. Fijar GHOST_FLAG según la phase *actual de la cabeza*
+        let genoma_ajustado = set_ghost(celula.genoma, self.phase);
+
+        // 2. Serializar con genoma ajustado
+        let nueva_celula = Celula { genoma: genoma_ajustado, ..celula };
+        let buffer = serializar(nueva_celula);
+
+        // 3. Escribir en slot actual
+        let offset = self.cursor * 64;
+        self.file.write_all_at(buffer, offset);
+
+        // 4. Guardar índice a devolver
+        let saved = self.cursor;
+
+        // 5. Avanzar cursor
+        self.cursor += 1;
+        if self.cursor >= self.max_records {
+            self.cursor = 0;
+            self.phase = !self.phase; // Invertimos la fase al dar la vuelta
+        }
+
+        return Ok(saved);
+    }
+
+    // ---------- READ ----------
+    fn read(&self, index: u32) -> Result<Celula> {
+        if index >= self.max_records { return Err(IndexOutOfBounds); }
+        let celula = Self::read_raw(self.file, index);
+        return Ok(celula);
+    }
+
+    // ---------- READ_AUTH ----------
+    fn read_auth(&self, index: u32, secret: &[u8]) -> Result<Celula> {
+        let celula = self.read(index)?;
+        
+        // Asumiendo que blake3 recibe (salt + secret)
+        let hash_esperado = blake3_hash(concatenar(celula.salt, secret));
+        
+        if hash_esperado != celula.hash {
+            return Err(Unauthorized);
+        }
+        return Ok(celula);
+    }
+
+    // ---------- UPDATE (sistema) ----------
+    fn update(&mut self, index: u32, nuevo_genoma: u32, x: u32, y: u32, z: u32) -> Result<()> {
+        let celula_actual = self.read(index)?;
+
+        // 1. EXTRAER LA FASE ORIGINAL. (¡Crítico para no romper el anillo!)
+        let fase_original = get_ghost(celula_actual.genoma);
+
+        // 2. Aplicar la fase ORIGINAL al nuevo genoma
+        let genoma_final = set_ghost(nuevo_genoma, fase_original);
+
+        // 3. Construir y serializar célula completa
+        let nueva = Celula {
+            hash: celula_actual.hash,   // Se conserva
+            salt: celula_actual.salt,   // Se conserva
+            genoma: genoma_final,
+            x: x, 
+            y: y, 
+            z: z
+        };
+
+        let buffer = serializar(nueva);
+        self.file.write_all_at(buffer, offset: index * 64);
+        return Ok(());
+    }
+
+    // ---------- UPDATE_AUTH ----------
+    fn update_auth(&mut self, index: u32, secret: &[u8], nuevo_genoma: u32, x: u32, y: u32, z: u32) -> Result<()> {
+        let celula_actual = self.read_auth(index, secret)?; // Valida la autorización
+
+        // Usamos la misma lógica crítica de conservación de fase
+        let fase_original = get_ghost(celula_actual.genoma);
+        let genoma_final = set_ghost(nuevo_genoma, fase_original);
+
+        let nueva = Celula {
+            hash: celula_actual.hash,
+            salt: celula_actual.salt,
+            genoma: genoma_final,
+            x: x, 
+            y: y, 
+            z: z
+        };
+
+        let buffer = serializar(nueva);
+        self.file.write_all_at(buffer, offset: index * 64);
+        return Ok(());
+    }
+}

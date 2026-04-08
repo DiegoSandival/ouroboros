@@ -1,0 +1,2 @@
+data_path = "ouroboros.db"
+max_records = 1024
