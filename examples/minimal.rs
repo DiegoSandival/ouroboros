@@ -44,15 +44,26 @@ fn main() -> Result<()> {
         read_auth.genoma, read_auth.x, read_auth.y, read_auth.z
     );
 
-    db.update(index, Genoma::LEER_SELF, 100, 200, 300)?;
+    let updated_plain = Celula::new(read_auth.hash, read_auth.salt, Genoma::LEER_SELF, 100, 200, 300);
+    db.update(index, updated_plain)?;
     let updated = db.read(index)?;
     println!(
         "update -> genoma={}, x={}, y={}, z={}",
         updated.genoma, updated.x, updated.y, updated.z
     );
 
-    db.update_auth(index, secret, Genoma::LEER_SELF | Genoma::BORRAR_SELF, 7, 8, 9)?;
-    let updated_auth = db.read_auth(index, secret)?;
+    let rotated_salt = [2u8; 16];
+    let rotated_secret = b"demo-secret-v2";
+    let updated_full = Celula::with_secret(
+        rotated_salt,
+        rotated_secret,
+        Genoma::LEER_SELF | Genoma::BORRAR_SELF,
+        7,
+        8,
+        9,
+    );
+    db.update_auth(index, secret, updated_full)?;
+    let updated_auth = db.read_auth(index, rotated_secret)?;
     println!(
         "update_auth -> genoma={}, x={}, y={}, z={}",
         updated_auth.genoma, updated_auth.x, updated_auth.y, updated_auth.z

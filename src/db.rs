@@ -184,36 +184,32 @@ impl OuroborosDb {
         Ok(celula)
     }
 
-    pub fn update(&mut self, index: u32, nuevo_genoma: u32, x: u32, y: u32, z: u32) -> Result<()> {
+    pub fn update(&mut self, index: u32, celula: Celula) -> Result<()> {
+        if celula.is_empty() {
+            return Err(Error::InvalidCell(
+                "the all-zero cell is reserved as the empty slot marker",
+            ));
+        }
+
         let current = self.read(index)?;
         let updated = Celula {
-            hash: current.hash,
-            salt: current.salt,
-            genoma: set_ghost(normalize_genoma(nuevo_genoma), get_ghost(current.genoma)),
-            x,
-            y,
-            z,
+            genoma: set_ghost(normalize_genoma(celula.genoma), get_ghost(current.genoma)),
+            ..celula
         };
         self.write_raw(index, updated)
     }
 
-    pub fn update_auth(
-        &mut self,
-        index: u32,
-        secret: &[u8],
-        nuevo_genoma: u32,
-        x: u32,
-        y: u32,
-        z: u32,
-    ) -> Result<()> {
+    pub fn update_auth(&mut self, index: u32, secret: &[u8], celula: Celula) -> Result<()> {
+        if celula.is_empty() {
+            return Err(Error::InvalidCell(
+                "the all-zero cell is reserved as the empty slot marker",
+            ));
+        }
+
         let current = self.read_auth(index, secret)?;
         let updated = Celula {
-            hash: current.hash,
-            salt: current.salt,
-            genoma: set_ghost(normalize_genoma(nuevo_genoma), get_ghost(current.genoma)),
-            x,
-            y,
-            z,
+            genoma: set_ghost(normalize_genoma(celula.genoma), get_ghost(current.genoma)),
+            ..celula
         };
         self.write_raw(index, updated)
     }
@@ -371,10 +367,14 @@ mod tests {
         let stored = db.read_auth(index, secret).expect("secret should match");
         assert!(!crate::get_ghost(stored.genoma));
 
-        db.update_auth(index, secret, Genoma::BORRAR_SELF, 9, 8, 7)
+        let rotated = Celula::with_secret([9u8; 16], b"nuevo-secreto", Genoma::BORRAR_SELF, 9, 8, 7);
+
+        db.update_auth(index, secret, rotated)
             .expect("update_auth should succeed");
 
-        let updated = db.read_auth(index, secret).expect("secret should still match");
+        let updated = db
+            .read_auth(index, b"nuevo-secreto")
+            .expect("new secret should match");
         assert_eq!(updated.x, 9);
         assert_eq!(updated.y, 8);
         assert_eq!(updated.z, 7);
